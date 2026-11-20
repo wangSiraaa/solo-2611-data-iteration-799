@@ -232,3 +232,243 @@ def run_demo(out_dir: str, materials: str = DEFAULT_MATERIALS) -> dict[str, Any]
     }
     report["document_id"] = document_id
     return report
+
+
+def run_collation_demo(out_dir: str) -> dict[str, Any]:
+    """Reproduce the bilingual-collation example end to end.
+
+    Source tokens ``a b c`` spell ``甲 乙 甲``; annotation selects ``b`` and
+    ``c``.  A revision inserts another ``甲`` (``n``) between them.  Target
+    tokens are ``p q r s``.  Verifies exact maximal intervals for the original
+    and corrected alignments, deletion of ``c`` with a same-literal reinsert,
+    immediate-literal re-insert identity, split/merge lineage (``b1`` continues,
+    ``x`` is mixed), stale-baseline rejection, and reopening the databases.
+    """
+
+    from .errors import (
+        InvalidTokenEdit,
+        TokenRevisionConflict,
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    source_db = os.path.join(out_dir, "collation_source.db")
+    delivery_db = os.path.join(out_dir, "collation_delivery.db")
+    for path in (source_db, delivery_db):
+        if os.path.exists(path):
+            os.remove(path)
+
+    report: dict[str, Any] = {"ok": True, "steps": [], "checks": []}
+
+    def check(name: str, condition: bool, detail: Any = None) -> None:
+        report["checks"].append({"name": name, "ok": bool(condition), "detail": detail})
+        if not condition:
+            report["ok"] = False
+
+    def step(name: str, payload: dict[str, Any]) -> None:
+        report["steps"].append({"name": name, **payload})
+
+    catalog = SourceCatalog(source_db)
+    repo = DeliveryRepository(delivery_db, PublishedSourceReader(source_db))
+
+    catalog.create_document("DOC-C", [{"segment_id": "S", "text": "甲 乙 甲"}])
+    catalog.set_initial_tokens(
+        "DOC-C",
+        "S",
+        [
+            {"token_id": "a", "literal": "甲"},
+            {"token_id": "b", "literal": "乙"},
+            {"token_id": "c", "literal": "甲"},
+        ],
+    )
+    catalog.add_annotation("ANN", "DOC-C", "S", 1, ["b", "c"], note="select b,c")
+    step("annotation_created", {"annotation_id": "ANN", "selected": ["b", "c"]})
+
+    # rev2: insert n (another 甲) between b and c.
+    plan = catalog.plan_token_edit(
+        "DOC-C",
+        "S",
+        1,
+        [
+            {"op": "keep", "token_id": "a"},
+            {"op": "keep", "token_id": "b"},
+            {"op": "insert", "token_id": "n", "literal": "甲"},
+            {"op": "keep", "token_id": "c"},
+        ],
+    )
+    catalog.publish_token_plan(plan)
+    step(
+        "rev2_tokens",
+        {"tokens": [(t.token_id, t.literal) for t in catalog.list_tokens("DOC-C", "S", 2)]},
+    )
+    res = catalog.resolve_annotation("ANN", 2)
+    check(
+        "rev2_survivors_b_c",
+        [t.token_id for t in res.survivors] == ["b", "c"],
+        [t.token_id for t in res.survivors],
+    )
+    check(
+        "inserted_n_not_auto_included",
+        all(t.token_id != "n" for t in res.survivors),
+    )
+
+    repo.add_translation(
+        "TR", "DOC-C", "EN", "pqrs", [{"segment_id": "S", "revision": 2}]
+    )
+    package = repo.publish_language("DOC-C", "EN", "P1")
+    repo.add_alignment(
+        "P1", "TR", 1, ["p", "q", "r", "s"], {"b": [3], "c": [0], "n": [1]}
+    )
+    proj = repo.project_annotation("ANN", 2, "P1", 1)
+    step("project_original_alignment", proj.to_dict())
+    check("original_intervals", proj.intervals == ((0, 1), (3, 4)), proj.intervals)
+
+    # Corrected alignment (new version): b->r, c->s.
+    repo.add_alignment("P1", "TR", 2, ["p", "q", "r", "s"], {"b": [2], "c": [3]})
+    proj2 = repo.project_annotation("ANN", 2, "P1", 2)
+    step("project_corrected_alignment", proj2.to_dict())
+    check("corrected_intervals", proj2.intervals == ((2, 4),), proj2.intervals)
+
+    # rev3: delete c, insert a fresh identity m with the same literal 甲.
+    plan3 = catalog.plan_token_edit(
+        "DOC-C",
+        "S",
+        2,
+        [
+            {"op": "keep", "token_id": "a"},
+            {"op": "keep", "token_id": "b"},
+            {"op": "keep", "token_id": "n"},
+            {"op": "delete", "token_id": "c"},
+            {"op": "insert", "token_id": "m", "literal": "甲"},
+        ],
+    )
+    catalog.publish_token_plan(plan3)
+    res3 = catalog.resolve_annotation("ANN", 3)
+    check("rev3_c_deleted", res3.deleted_token_ids == ("c",), res3.deleted_token_ids)
+    check(
+        "rev3_m_not_inherited",
+        all(t.token_id != "m" for t in res3.survivors),
+    )
+    repo.add_translation(
+        "TR3", "DOC-C", "EN", "pqrs", [{"segment_id": "S", "revision": 3}]
+    )
+    repo.publish_language("DOC-C", "EN", "P2")
+    repo.add_alignment("P2", "TR3", 1, ["p", "q", "r", "s"], {"b": [3]})
+    proj3 = repo.project_annotation("ANN", 3, "P2", 1)
+    step("project_after_delete", proj3.to_dict())
+    check("after_delete_intervals", proj3.intervals == ((3, 4),), proj3.intervals)
+    check("after_delete_reports_c", proj3.deleted_token_ids == ("c",), proj3.deleted_token_ids)
+
+    # Same-literal reinsertion mints a never-before-used identity; reusing c's
+    # identity for a new insert is rejected.
+    rejected = False
+    try:
+        catalog.apply_token_edit(
+            "DOC-C",
+            "S",
+            3,
+            [
+                {"op": "keep", "token_id": "a"},
+                {"op": "keep", "token_id": "b"},
+                {"op": "keep", "token_id": "n"},
+                {"op": "keep", "token_id": "m"},
+                {"op": "delete", "token_id": "m"},
+                {"op": "insert", "token_id": "c", "literal": "甲"},
+            ],
+        )
+    except InvalidTokenEdit:
+        rejected = True
+    check("reuse_deleted_identity_rejected", rejected)
+
+    # Split / merge lineage on a fresh document.
+    catalog.create_document("DOC-S", [{"segment_id": "S", "text": "甲 乙 甲"}])
+    catalog.set_initial_tokens(
+        "DOC-S",
+        "S",
+        [
+            {"token_id": "a", "literal": "甲"},
+            {"token_id": "b", "literal": "乙"},
+            {"token_id": "c", "literal": "甲"},
+        ],
+    )
+    catalog.add_annotation("ANN-S", "DOC-S", "S", 1, ["b", "c"])
+    catalog.apply_token_edit(
+        "DOC-S",
+        "S",
+        1,
+        [
+            {"op": "keep", "token_id": "a"},
+            {
+                "op": "split",
+                "token_id": "b",
+                "literals": ["乙1", "乙2"],
+                "new_token_ids": ["b1", "b2"],
+            },
+            {"op": "insert", "token_id": "n", "literal": "丙"},
+            {"op": "keep", "token_id": "c"},
+        ],
+    )
+    catalog.apply_token_edit(
+        "DOC-S",
+        "S",
+        2,
+        [
+            {"op": "keep", "token_id": "a"},
+            {"op": "keep", "token_id": "b1"},
+            {"op": "merge", "token_ids": ["b2", "n"], "literal": "乙2丙", "token_id": "x"},
+            {"op": "keep", "token_id": "c"},
+        ],
+    )
+    res_s = catalog.resolve_annotation("ANN-S", 3)
+    step("split_merge_resolution", res_s.to_dict())
+    check(
+        "split_b1_continues",
+        any(t.token_id == "b1" and t.fully_selected for t in res_s.survivors),
+    )
+    check(
+        "merged_x_is_mixed",
+        any(t.token_id == "x" and not t.fully_selected for t in res_s.mixed),
+    )
+
+    # Stale baseline cannot overwrite a newer revision.
+    stale_plan = catalog.plan_token_edit(
+        "DOC-S",
+        "S",
+        3,
+        [
+            {"op": "keep", "token_id": "a"},
+            {"op": "keep", "token_id": "b1"},
+            {"op": "keep", "token_id": "x"},
+            {"op": "keep", "token_id": "c"},
+        ],
+    )
+    catalog.apply_token_edit(
+        "DOC-S",
+        "S",
+        3,
+        [
+            {"op": "keep", "token_id": "a"},
+            {"op": "delete", "token_id": "b1"},
+            {"op": "delete", "token_id": "x"},
+            {"op": "keep", "token_id": "c"},
+        ],
+    )
+    stale_rejected = False
+    try:
+        catalog.publish_token_plan(stale_plan)
+    except TokenRevisionConflict:
+        stale_rejected = True
+    check("stale_baseline_rejected", stale_rejected)
+
+    # Reopen both databases: the same version combination must reproduce.
+    reopened_catalog = SourceCatalog(source_db)
+    reopened_repo = DeliveryRepository(delivery_db, PublishedSourceReader(source_db))
+    again = reopened_repo.project_annotation("ANN", 2, "P1", 1)
+    check("reopen_reproduces", again.intervals == ((0, 1), (3, 4)), again.intervals)
+    check(
+        "reopen_alignment_version",
+        reopened_repo.get_alignment("P1", "TR").version == 2,
+        reopened_repo.get_alignment("P1", "TR").version,
+    )
+    _ = reopened_catalog
+    report["document_id"] = "DOC-C"
+    return report

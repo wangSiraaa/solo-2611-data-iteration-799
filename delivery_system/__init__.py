@@ -16,26 +16,41 @@ No translation or semantic scoring happens here: text is opaque.
 from .coverage import solve_cover
 from .delivery_repository import DeliveryRepository
 from .models import (
+    AnnotationResolution,
+    BlockAlignment,
+    CollationAnnotation,
     CoverChunk,
     CoverDiagnosis,
     CoverResult,
+    ProjectionResult,
     SourceProduct,
     SourceRef,
     SourceSegment,
+    SourceToken,
+    TokenEditPlan,
+    TokenLineage,
     TranslationAssessment,
     TranslationEntry,
 )
-from .source_catalog import SourceCatalog
+from .source_catalog import PublishedSourceReader, SourceCatalog
 
 __all__ = [
+    "AnnotationResolution",
+    "BlockAlignment",
+    "CollationAnnotation",
     "CoverChunk",
     "CoverDiagnosis",
     "CoverResult",
     "DeliveryRepository",
+    "ProjectionResult",
+    "PublishedSourceReader",
     "SourceCatalog",
     "SourceProduct",
     "SourceRef",
     "SourceSegment",
+    "SourceToken",
+    "TokenEditPlan",
+    "TokenLineage",
     "TranslationAssessment",
     "TranslationEntry",
     "solve_cover",

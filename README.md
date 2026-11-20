@@ -24,14 +24,22 @@ python3 -m unittest discover -s tests -v
 delivery_system/
   models.py              不可变值对象：SourceSegment/SourceProduct/SourceRef/
                          TranslationEntry/CoverChunk/CoverDiagnosis/CoverResult
+                         + SourceToken/TokenEditPlan/CollationAnnotation/
+                         TokenLineage/AnnotationResolution/BlockAlignment/
+                         ProjectionResult
   source_catalog.py      源段目录（独立 SQLite + 发布快照 + release 历史）
-                         + PublishedSourceReader（交付侧只读句柄）
+                         + 词元修订/编辑批次/校勘批注（+ PublishedSourceReader
+                         只读句柄）
+  collation.py           词元身份编辑校验（keep/move/insert/delete/split/merge）
+                         + 沿修订的谱系解析（幸存/删除/混合来源）
   coverage.py            条目评估 + 精确覆盖区间 DP + 失败诊断
   delivery_repository.py 译文条目、覆盖计划、不可变发布包（独立 SQLite）
+                         + 块对齐版本 + 批注投影
   package_io.py          translation-package/1 写入与结构/覆盖校验
   cli.py / __main__.py   命令行
-  demo.py                materials/753 端到端复现（调用官方 package_reader.py）
+  demo.py                materials/753 端到端复现 + 词元/校勘/投影复现
 tests/test_delivery.py   20 个测试：覆盖、过期、重组、不可变、规模
+tests/test_collation.py  21 个测试：词元身份、谱系、投影、重开复现
 ```
 
 ## 两侧的实质逻辑
@@ -82,6 +90,60 @@ content_sha256/created_at/source_release`。包一旦写入即不可变：同 id
 | 读旧包 PACK1 | 仍为 S1@1..S4@1 与旧译文 id/文本 |
 
 `package_reader.py` 被以子进程方式真实读取新旧两个包并校验输出。
+
+## 词元级校勘（源目录 + 译文仓）
+
+源段在纯文本之外可携带**带身份的词元**。身份是 `token_id`，字面值只用于显示；
+同一段中相同拼写出现多次不会混淆。业务输入直接给出有序词元及其字面值，不做自动
+分词、翻译或对齐猜测。
+
+### 源目录：带身份的修订
+- `set_initial_tokens` 给段附加初始词元（`origin=initial`）。未提供词元的旧段落继续
+  使用原 `segment_id/revision/text` 接口；涉及它们的校勘请求抛
+  `TokenMaterialMissing`（`reason="missing_token_material"`），可辨识。
+- `apply_token_edit(base_revision, ops)` 是对词的**显式编辑批次**：
+  - `keep` / `move` 沿用身份；`insert` 总是铸造**从未用过**的新身份（即使字面与刚删的
+    一样，复用旧 id 会被拒绝）。
+  - `delete` 删除；`split` 把一词拆成多词、`merge` 把相邻数词合为一词，二者都必须
+    显式给出 `parents`（紧邻的旧词）。`origin=insert` 没有来源，因此“有来源的重写”
+    与“无来源的新插入”可区分。
+  - 批次的 `base_revision` 必须仍为当前修订，否则 `TokenRevisionConflict`——**过时
+    基线不能覆盖新稿**。批次在一个事务内写修订、词元与 release 快照。
+- `plan_token_edit` 先产出可核对的最终顺序（含新铸造身份），`publish_token_plan`
+  带 `expected_final` 校验后再发布；核对与发布之间身份不变。
+- `add_annotation` 在**原修订**上登记所选词元身份。`resolve_annotation(target)`
+  沿多次修订追踪，返回：仍存 `survivors`、已删 `deleted_token_ids`、混合来源
+  `mixed`。选择内部后来插入的词不自动纳入；`split` 出的全选成分可接续，`merge`
+  时只要有一枚成分不属于原选择就记为**混合**并留给人工，绝不因命中任一祖词而涂全词。
+
+### 译文仓：版本化块对齐与投影
+- `add_alignment(package_id, block_id, version, target_tokens, mapping)` 为已交付包的
+  一个**不可变块**登记人工对齐。`mapping` 是 `源词元 -> 目标位置`，支持一对多、多对一
+  与显式无对应（空列表/`None`）。对齐的源修订、块身份、词元串都必须与实际包相符，
+  否则 `InvalidAlignment` / `SourcePackageMismatch`，绝不混配源与包。
+- 版本不可改：修正错对齐须新增版本（同版本不同内容抛 `AlignmentConflict`）。
+- `project_annotation(annotation, source_revision, package, alignment_version)`
+  先解析原选择在指定源修订的幸存者，再经对齐投影到目标次序，返回**互不重叠的极大
+  连续半开区间**，并报告被删、显式无对应、尚未标注的词元。多对一位置只计一次，不会
+  把中间别的译词一并高亮。
+- 库重开后以相同版本组合可重现同一校样（对齐与批注均持久化在各自 SQLite）。
+
+### 复现题目示例
+
+```bash
+python3 -m delivery_system demo-collation   # 全部检查应全为 True
+```
+
+| 步骤 | 结果 |
+|---|---|
+| 原文 `a b c` = 「甲 乙 甲」，批注选 `b,c` | 登记于修订 1 |
+| 新稿在二者间插入同字词 `n` | 批注仍只含 `b,c`，`n` 不自动纳入 |
+| 对齐 `b→s, c→p, n→q` | 高亮 `[0,1)`、`[3,4)` |
+| 更正版对齐 `b→r, c→s` | 只高亮 `[2,4)` |
+| 删除 `c` 并同字重插新身份 | 报告 `c` 已删；新字词不被当作 `c` |
+| `b` 拆 `b1,b2`，下一版 `b2` 与未选 `n` 合为 `x` | `b1` 自动接续；`x` 记为混合来源，留人工 |
+| 过时基线批次 | `TokenRevisionConflict`，不能覆盖新稿 |
+| 重开数据库复跑 | 相同版本组合重现相同区间 |
 
 ## 规模与不扩平台
 

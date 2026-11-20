@@ -429,6 +429,153 @@ def cmd_run_operations(args: argparse.Namespace) -> int:
     return 0 if ok else 3
 
 
+# ----------------------------------------------------------------------
+# token / collation commands
+# ----------------------------------------------------------------------
+def _token_json(token) -> dict[str, Any]:
+    return {
+        "token_id": token.token_id,
+        "literal": token.literal,
+        "position": token.position,
+        "origin": token.origin,
+        "parents": list(token.parents),
+    }
+
+
+def cmd_tokens_show(args: argparse.Namespace) -> int:
+    catalog, _ = _open(args)
+    document_id = _document(args, catalog)
+    tokens = catalog.list_tokens(document_id, args.segment_id, args.revision)
+    _emit(
+        {
+            "document_id": document_id,
+            "segment_id": args.segment_id,
+            "revision": tokens[0].revision if tokens else args.revision,
+            "tokens": [_token_json(t) for t in tokens],
+        }
+    )
+    return 0
+
+
+def cmd_tokens_init(args: argparse.Namespace) -> int:
+    catalog, _ = _open(args)
+    document_id = _document(args, catalog)
+    tokens = json.loads(args.tokens)
+    result = catalog.set_initial_tokens(
+        document_id, args.segment_id, tokens, text=args.text
+    )
+    _emit(
+        {
+            "document_id": document_id,
+            "segment_id": args.segment_id,
+            "revision": result[0].revision if result else None,
+            "tokens": [_token_json(t) for t in result],
+        }
+    )
+    return 0
+
+
+def cmd_tokens_edit(args: argparse.Namespace) -> int:
+    catalog, _ = _open(args)
+    document_id = _document(args, catalog)
+    ops = json.loads(args.ops)
+    plan = catalog.apply_token_edit(
+        document_id, args.segment_id, args.base_revision, ops, text=args.text
+    )
+    _emit(
+        {
+            "document_id": document_id,
+            "segment_id": args.segment_id,
+            "new_revision": plan.new_revision,
+            "new_token_ids": list(plan.new_token_ids),
+            "tokens": [_token_json(t) for t in plan.tokens],
+        }
+    )
+    return 0
+
+
+def cmd_annotation_add(args: argparse.Namespace) -> int:
+    catalog, _ = _open(args)
+    document_id = _document(args, catalog)
+    selected = json.loads(args.selected)
+    ann = catalog.add_annotation(
+        args.annotation_id,
+        document_id,
+        args.segment_id,
+        args.base_revision,
+        selected,
+        note=args.note,
+    )
+    _emit(
+        {
+            "annotation_id": ann.annotation_id,
+            "document_id": ann.document_id,
+            "segment_id": ann.segment_id,
+            "base_revision": ann.base_revision,
+            "selected_token_ids": list(ann.selected_token_ids),
+            "note": ann.note,
+        }
+    )
+    return 0
+
+
+def cmd_annotation_resolve(args: argparse.Namespace) -> int:
+    _, repo = _open(args, readonly_source=True)
+    resolution = repo.source.resolve_annotation(  # type: ignore[attr-defined]
+        args.annotation_id, args.target_revision
+    )
+    _emit(resolution.to_dict())
+    return 0 if resolution.ok else 5
+
+
+def cmd_alignment_add(args: argparse.Namespace) -> int:
+    _, repo = _open(args, readonly_source=True)
+    mapping = json.loads(args.mapping)
+    alignment = repo.add_alignment(
+        args.package_id,
+        args.block_id,
+        args.version,
+        json.loads(args.target_tokens),
+        mapping,
+        target_text=args.target_text,
+    )
+    _emit(alignment.to_dict())
+    return 0
+
+
+def cmd_alignment_show(args: argparse.Namespace) -> int:
+    _, repo = _open(args, readonly_source=True)
+    alignment = repo.get_alignment(args.package_id, args.block_id, args.version)
+    _emit(alignment.to_dict())
+    return 0
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    _, repo = _open(args, readonly_source=True)
+    projection = repo.project_annotation(
+        args.annotation_id,
+        args.source_revision,
+        args.package_id,
+        args.alignment_version,
+        block_id=args.block_id,
+    )
+    _emit(projection.to_dict())
+    return 0 if projection.ok else 5
+
+
+def cmd_demo_collation(args: argparse.Namespace) -> int:
+    """End-to-end collation example (token identity, lineage, projection)."""
+
+    import tempfile
+
+    from .demo import run_collation_demo
+
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_collation_demo(tmp)
+    _emit(report)
+    return 0 if report["ok"] else 3
+
+
 def cmd_demo(args: argparse.Namespace) -> int:
     """End-to-end run over materials/753 using a throw-away temp directory."""
 
@@ -516,7 +663,71 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("run-operations", cmd_run_operations, "replay an operations.jsonl")
     sp.add_argument("--operations", required=True)
 
+    # token material -----------------------------------------------------
+    sp = add("tokens-show", cmd_tokens_show, "list token identities for a segment revision")
+    sp.add_argument("segment_id")
+    sp.add_argument("--revision", type=int, default=None)
+
+    sp = add("tokens-init", cmd_tokens_init, "attach initial token material")
+    sp.add_argument("segment_id")
+    sp.add_argument("--tokens", required=True, help="JSON list of {token_id?,literal}")
+    sp.add_argument("--text", default=None)
+
+    sp = add(
+        "tokens-edit",
+        cmd_tokens_edit,
+        "apply an explicit edit batch (keep/move/insert/delete/split/merge)",
+    )
+    sp.add_argument("segment_id")
+    sp.add_argument("base_revision", type=int)
+    sp.add_argument("--ops", required=True, help="JSON list of edit ops")
+    sp.add_argument("--text", default=None)
+
+    sp = add("annotation-add", cmd_annotation_add, "register a collation annotation")
+    sp.add_argument("annotation_id")
+    sp.add_argument("segment_id")
+    sp.add_argument("base_revision", type=int)
+    sp.add_argument("--selected", required=True, help="JSON list of token ids")
+    sp.add_argument("--note", default="")
+
+    sp = add(
+        "annotation-resolve",
+        cmd_annotation_resolve,
+        "follow an annotation to a later segment revision",
+    )
+    sp.add_argument("annotation_id")
+    sp.add_argument("target_revision", type=int)
+
+    sp = add("alignment-add", cmd_alignment_add, "register a versioned block alignment")
+    sp.add_argument("package_id")
+    sp.add_argument("block_id")
+    sp.add_argument("version", type=int)
+    sp.add_argument("--target-tokens", required=True, help="JSON list of target tokens")
+    sp.add_argument("--mapping", required=True, help="JSON object token_id -> positions")
+    sp.add_argument("--target-text", default=None)
+
+    sp = add("alignment-show", cmd_alignment_show, "show one block alignment version")
+    sp.add_argument("package_id")
+    sp.add_argument("block_id")
+    sp.add_argument("--version", type=int, default=None)
+
+    sp = add(
+        "project",
+        cmd_project,
+        "project an annotation onto a package block's exact target intervals",
+    )
+    sp.add_argument("annotation_id")
+    sp.add_argument("source_revision", type=int)
+    sp.add_argument("package_id")
+    sp.add_argument("--alignment-version", type=int, default=None)
+    sp.add_argument("--block-id", default=None)
+
     add("demo", cmd_demo, "run the end-to-end materials/753 demo")
+    add(
+        "demo-collation",
+        cmd_demo_collation,
+        "run the end-to-end token-identity / collation / projection demo",
+    )
     return p
 
 
